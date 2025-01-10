@@ -1,16 +1,23 @@
 package cloudreve
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/setting"
 	"github.com/alist-org/alist/v3/pkg/cookie"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	json "github.com/json-iterator/go"
 	jsoniter "github.com/json-iterator/go"
@@ -22,15 +29,18 @@ const loginPath = "/user/session"
 
 func (d *Cloudreve) request(method string, path string, callback base.ReqCallback, out interface{}) error {
 	u := d.Address + "/api/v3" + path
+	ua := d.CustomUA
+	if ua == "" {
+		ua = base.UserAgent
+	}
 	req := base.RestyClient.R()
 	req.SetHeaders(map[string]string{
 		"Cookie":     "cloudreve-session=" + d.Cookie,
 		"Accept":     "application/json, text/plain, */*",
-		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+		"User-Agent": ua,
 	})
 
 	var r Resp
-
 	req.SetResult(&r)
 
 	if callback != nil {
@@ -145,4 +155,119 @@ func convertSrc(obj model.Obj) map[string]interface{} {
 	m["dirs"] = dirs
 	m["items"] = items
 	return m
+}
+
+func (d *Cloudreve) GetThumb(file Object) (model.Thumbnail, error) {
+	if !d.Addition.EnableThumbAndFolderSize {
+		return model.Thumbnail{}, nil
+	}
+	ua := d.CustomUA
+	if ua == "" {
+		ua = base.UserAgent
+	}
+	req := base.NoRedirectClient.R()
+	req.SetHeaders(map[string]string{
+		"Cookie":     "cloudreve-session=" + d.Cookie,
+		"Accept":     "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+		"User-Agent": ua,
+	})
+	resp, err := req.Execute(http.MethodGet, d.Address+"/api/v3/file/thumb/"+file.Id)
+	if err != nil {
+		return model.Thumbnail{}, err
+	}
+	return model.Thumbnail{
+		Thumbnail: resp.Header().Get("Location"),
+	}, nil
+}
+
+func (d *Cloudreve) upRemote(ctx context.Context, stream model.FileStreamer, u UploadInfo, up driver.UpdateProgress) error {
+	uploadUrl := u.UploadURLs[0]
+	credential := u.Credential
+	var finish int64 = 0
+	var chunk int = 0
+	DEFAULT := int64(u.ChunkSize)
+	for finish < stream.GetSize() {
+		if utils.IsCanceled(ctx) {
+			return ctx.Err()
+		}
+		utils.Log.Debugf("[Cloudreve-Remote] upload: %d", finish)
+		var byteSize = DEFAULT
+		left := stream.GetSize() - finish
+		if left < DEFAULT {
+			byteSize = left
+		}
+		byteData := make([]byte, byteSize)
+		n, err := io.ReadFull(stream, byteData)
+		utils.Log.Debug(err, n)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("POST", uploadUrl+"?chunk="+strconv.Itoa(chunk), bytes.NewBuffer(byteData))
+		if err != nil {
+			return err
+		}
+		req = req.WithContext(ctx)
+		req.Header.Set("Content-Length", strconv.Itoa(int(byteSize)))
+		req.Header.Set("Authorization", fmt.Sprint(credential))
+		finish += byteSize
+		res, err := base.HttpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		res.Body.Close()
+		up(float64(finish) * 100 / float64(stream.GetSize()))
+		chunk++
+	}
+	return nil
+}
+
+func (d *Cloudreve) upOneDrive(ctx context.Context, stream model.FileStreamer, u UploadInfo, up driver.UpdateProgress) error {
+	uploadUrl := u.UploadURLs[0]
+	var finish int64 = 0
+	DEFAULT := int64(u.ChunkSize)
+	for finish < stream.GetSize() {
+		if utils.IsCanceled(ctx) {
+			return ctx.Err()
+		}
+		utils.Log.Debugf("[Cloudreve-OneDrive] upload: %d", finish)
+		var byteSize = DEFAULT
+		left := stream.GetSize() - finish
+		if left < DEFAULT {
+			byteSize = left
+		}
+		byteData := make([]byte, byteSize)
+		n, err := io.ReadFull(stream, byteData)
+		utils.Log.Debug(err, n)
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequest("PUT", uploadUrl, bytes.NewBuffer(byteData))
+		if err != nil {
+			return err
+		}
+		req = req.WithContext(ctx)
+		req.Header.Set("Content-Length", strconv.Itoa(int(byteSize)))
+		req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", finish, finish+byteSize-1, stream.GetSize()))
+		finish += byteSize
+		res, err := base.HttpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		// https://learn.microsoft.com/zh-cn/onedrive/developer/rest-api/api/driveitem_createuploadsession
+		if res.StatusCode != 201 && res.StatusCode != 202 && res.StatusCode != 200 {
+			data, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+			return errors.New(string(data))
+		}
+		res.Body.Close()
+		up(float64(finish) * 100 / float64(stream.GetSize()))
+	}
+	// 上传成功发送回调请求
+	err := d.request(http.MethodPost, "/callback/onedrive/finish/"+u.SessionID, func(req *resty.Request) {
+		req.SetBody("{}")
+	}, nil)
+	if err != nil {
+		return err
+	}
+	return nil
 }
