@@ -1,13 +1,19 @@
 package model
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/alist-org/alist/v3/pkg/http_range"
+	"github.com/alist-org/alist/v3/pkg/utils"
 )
 
 type ListArgs struct {
-	ReqPath string
+	ReqPath           string
+	S3ShowPlaceholder bool
+	Refresh           bool
 }
 
 type LinkArgs struct {
@@ -18,14 +24,17 @@ type LinkArgs struct {
 }
 
 type Link struct {
-	URL        string         `json:"url"`
-	Header     http.Header    `json:"header"` // needed header (for url) or response header(for data or writer)
-	Data       io.ReadCloser  // return file reader directly
-	Status     int            // status maybe 200 or 206, etc
-	FilePath   *string        // local file, return the filepath
-	Expiration *time.Duration // url expiration time
-	//Handle     func(w http.ResponseWriter, r *http.Request) error `json:"-"` // custom handler
-	Writer WriterFunc `json:"-"` // custom writer
+	URL             string            `json:"url"`    // most common way
+	Header          http.Header       `json:"header"` // needed header (for url)
+	RangeReadCloser RangeReadCloserIF `json:"-"`      // recommended way if can't use URL
+	MFile           File              `json:"-"`      // best for local,smb... file system, which exposes MFile
+
+	Expiration *time.Duration // local cache expire Duration
+	IPCacheKey bool           `json:"-"` // add ip to cache key
+
+	//for accelerating request, use multi-thread downloading
+	Concurrency int `json:"concurrency"`
+	PartSize    int `json:"part_size"`
 }
 
 type OtherArgs struct {
@@ -40,4 +49,49 @@ type FsOtherArgs struct {
 	Data   interface{} `json:"data" form:"data"`
 }
 
-type WriterFunc func(w io.Writer) error
+type ArchiveArgs struct {
+	Password string
+	LinkArgs
+}
+
+type ArchiveInnerArgs struct {
+	ArchiveArgs
+	InnerPath string
+}
+
+type ArchiveMetaArgs struct {
+	ArchiveArgs
+	Refresh bool
+}
+
+type ArchiveListArgs struct {
+	ArchiveInnerArgs
+	Refresh bool
+}
+
+type ArchiveDecompressArgs struct {
+	ArchiveInnerArgs
+	CacheFull     bool
+	PutIntoNewDir bool
+}
+
+type RangeReadCloserIF interface {
+	RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
+	utils.ClosersIF
+}
+
+var _ RangeReadCloserIF = (*RangeReadCloser)(nil)
+
+type RangeReadCloser struct {
+	RangeReader RangeReaderFunc
+	utils.Closers
+}
+
+func (r RangeReadCloser) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+	rc, err := r.RangeReader(ctx, httpRange)
+	r.Closers.Add(rc)
+	return rc, err
+}
+
+// type WriterFunc func(w io.Writer) error
+type RangeReaderFunc func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)

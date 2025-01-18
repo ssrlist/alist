@@ -10,7 +10,7 @@ import (
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/caarlos0/env/v7"
+	"github.com/caarlos0/env/v9"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -34,6 +34,8 @@ func InitConfig() {
 			log.Fatalf("failed to create config file: %+v", err)
 		}
 		conf.Conf = conf.DefaultConfig()
+		LastLaunchedVersion = conf.Version
+		conf.Conf.LastLaunchedVersion = conf.Version
 		if !utils.WriteJsonToFile(configPath, conf.Conf) {
 			log.Fatalf("failed to create default config file")
 		}
@@ -46,6 +48,10 @@ func InitConfig() {
 		err = utils.Json.Unmarshal(configBytes, conf.Conf)
 		if err != nil {
 			log.Fatalf("load config error: %+v", err)
+		}
+		LastLaunchedVersion = conf.Conf.LastLaunchedVersion
+		if conf.Version != "dev" || LastLaunchedVersion == "" {
+			conf.Conf.LastLaunchedVersion = conf.Version
 		}
 		// update config.json struct
 		confBody, err := utils.Json.MarshalIndent(conf.Conf, "", "  ")
@@ -68,11 +74,7 @@ func InitConfig() {
 		}
 		conf.Conf.TempDir = absPath
 	}
-	err := os.RemoveAll(filepath.Join(conf.Conf.TempDir))
-	if err != nil {
-		log.Errorln("failed delete temp file:", err)
-	}
-	err = os.MkdirAll(conf.Conf.TempDir, 0o777)
+	err := os.MkdirAll(conf.Conf.TempDir, 0o777)
 	if err != nil {
 		log.Fatalf("create temp dir error: %+v", err)
 	}
@@ -87,7 +89,7 @@ func confFromEnv() {
 		prefix = ""
 	}
 	log.Infof("load config from env with prefix: %s", prefix)
-	if err := env.Parse(conf.Conf, env.Options{
+	if err := env.ParseWithOptions(conf.Conf, env.Options{
 		Prefix: prefix,
 	}); err != nil {
 		log.Fatalf("load config from env error: %+v", err)
@@ -103,4 +105,16 @@ func initURL() {
 		utils.Log.Fatalf("can't parse site_url: %+v", err)
 	}
 	conf.URL = u
+}
+
+func CleanTempDir() {
+	files, err := os.ReadDir(conf.Conf.TempDir)
+	if err != nil {
+		log.Errorln("failed list temp file: ", err)
+	}
+	for _, file := range files {
+		if err := os.RemoveAll(filepath.Join(conf.Conf.TempDir, file.Name())); err != nil {
+			log.Errorln("failed delete temp file: ", err)
+		}
+	}
 }

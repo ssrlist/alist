@@ -2,9 +2,9 @@ package handles
 
 import (
 	"fmt"
+	"github.com/alist-org/alist/v3/internal/task"
 	"io"
 	stdpath "path"
-	"regexp"
 
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/fs"
@@ -56,9 +56,10 @@ func FsMkdir(c *gin.Context) {
 }
 
 type MoveCopyReq struct {
-	SrcDir string   `json:"src_dir"`
-	DstDir string   `json:"dst_dir"`
-	Names  []string `json:"names"`
+	SrcDir    string   `json:"src_dir"`
+	DstDir    string   `json:"dst_dir"`
+	Names     []string `json:"names"`
+	Overwrite bool     `json:"overwrite"`
 }
 
 func FsMove(c *gin.Context) {
@@ -86,6 +87,14 @@ func FsMove(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
+	if !req.Overwrite {
+		for _, name := range req.Names {
+			if res, _ := fs.Get(c, stdpath.Join(dstDir, name), &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, "file exists", 403)
+				return
+			}
+		}
+	}
 	for i, name := range req.Names {
 		err := fs.Move(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
 		if err != nil {
@@ -93,94 +102,6 @@ func FsMove(c *gin.Context) {
 			return
 		}
 	}
-	common.SuccessResp(c)
-}
-
-type RecursiveMoveReq struct {
-	SrcDir string `json:"src_dir"`
-	DstDir string `json:"dst_dir"`
-}
-
-func FsRecursiveMove(c *gin.Context) {
-	var req RecursiveMoveReq
-	if err := c.ShouldBind(&req); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-
-	user := c.MustGet("user").(*model.User)
-	if !user.CanMove() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
-	srcDir, err := user.JoinPath(req.SrcDir)
-	if err != nil {
-		common.ErrorResp(c, err, 403)
-		return
-	}
-	dstDir, err := user.JoinPath(req.DstDir)
-	if err != nil {
-		common.ErrorResp(c, err, 403)
-		return
-	}
-
-	meta, err := op.GetNearestMeta(srcDir)
-	if err != nil {
-		if !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-			common.ErrorResp(c, err, 500, true)
-			return
-		}
-	}
-	c.Set("meta", meta)
-
-	rootFiles, err := fs.List(c, srcDir, &fs.ListArgs{})
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-
-	// record the file path
-	filePathMap := make(map[model.Obj]string)
-	movingFiles := generic.NewQueue[model.Obj]()
-	for _, file := range rootFiles {
-		movingFiles.Push(file)
-		filePathMap[file] = srcDir
-	}
-
-	for !movingFiles.IsEmpty() {
-
-		movingFile := movingFiles.Pop()
-		movingFilePath := filePathMap[movingFile]
-		movingFileName := fmt.Sprintf("%s/%s", movingFilePath, movingFile.GetName())
-		if movingFile.IsDir() {
-			// directory, recursive move
-			subFilePath := movingFileName
-			subFiles, err := fs.List(c, movingFileName, &fs.ListArgs{Refresh: true})
-			if err != nil {
-				common.ErrorResp(c, err, 500)
-				return
-			}
-			for _, subFile := range subFiles {
-				movingFiles.Push(subFile)
-				filePathMap[subFile] = subFilePath
-			}
-		} else {
-
-			if movingFilePath == dstDir {
-				// same directory, don't move
-				continue
-			}
-
-			// move
-			err := fs.Move(c, movingFileName, dstDir, movingFiles.IsEmpty())
-			if err != nil {
-				common.ErrorResp(c, err, 500)
-				return
-			}
-		}
-
-	}
-
 	common.SuccessResp(c)
 }
 
@@ -209,27 +130,34 @@ func FsCopy(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
-	var addedTask []string
+	if !req.Overwrite {
+		for _, name := range req.Names {
+			if res, _ := fs.Get(c, stdpath.Join(dstDir, name), &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, "file exists", 403)
+				return
+			}
+		}
+	}
+	var addedTasks []task.TaskExtensionInfo
 	for i, name := range req.Names {
-		ok, err := fs.Copy(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
-		if ok {
-			addedTask = append(addedTask, name)
+		t, err := fs.Copy(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
+		if t != nil {
+			addedTasks = append(addedTasks, t)
 		}
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
 		}
 	}
-	if len(addedTask) > 0 {
-		common.SuccessResp(c, fmt.Sprintf("Added %d tasks", len(addedTask)))
-	} else {
-		common.SuccessResp(c)
-	}
+	common.SuccessResp(c, gin.H{
+		"tasks": getTaskInfos(addedTasks),
+	})
 }
 
 type RenameReq struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	Overwrite bool   `json:"overwrite"`
 }
 
 func FsRename(c *gin.Context) {
@@ -248,71 +176,19 @@ func FsRename(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
+	if !req.Overwrite {
+		dstPath := stdpath.Join(stdpath.Dir(reqPath), req.Name)
+		if dstPath != reqPath {
+			if res, _ := fs.Get(c, dstPath, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, "file exists", 403)
+				return
+			}
+		}
+	}
 	if err := fs.Rename(c, reqPath, req.Name); err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c)
-}
-
-type RegexRenameReq struct {
-	SrcDir       string `json:"src_dir"`
-	SrcNameRegex string `json:"src_name_regex"`
-	NewNameRegex string `json:"new_name_regex"`
-}
-
-func FsRegexRename(c *gin.Context) {
-	var req RegexRenameReq
-	if err := c.ShouldBind(&req); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	user := c.MustGet("user").(*model.User)
-	if !user.CanRename() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
-
-	reqPath, err := user.JoinPath(req.SrcDir)
-	if err != nil {
-		common.ErrorResp(c, err, 403)
-		return
-	}
-
-	meta, err := op.GetNearestMeta(reqPath)
-	if err != nil {
-		if !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-			common.ErrorResp(c, err, 500, true)
-			return
-		}
-	}
-	c.Set("meta", meta)
-
-	srcRegexp, err := regexp.Compile(req.SrcNameRegex)
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-
-	files, err := fs.List(c, reqPath, &fs.ListArgs{})
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-
-	for _, file := range files {
-
-		if srcRegexp.MatchString(file.GetName()) {
-			filePath := fmt.Sprintf("%s/%s", reqPath, file.GetName())
-			newFileName := srcRegexp.ReplaceAllString(file.GetName(), req.NewNameRegex)
-			if err := fs.Rename(c, filePath, newFileName); err != nil {
-				common.ErrorResp(c, err, 500)
-				return
-			}
-		}
-
-	}
-
 	common.SuccessResp(c)
 }
 
@@ -481,13 +357,13 @@ func Link(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	if link.Data != nil {
-		defer func(Data io.ReadCloser) {
-			err := Data.Close()
+	if link.MFile != nil {
+		defer func(ReadSeekCloser io.ReadCloser) {
+			err := ReadSeekCloser.Close()
 			if err != nil {
 				log.Errorf("close link data error: %v", err)
 			}
-		}(link.Data)
+		}(link.MFile)
 	}
 	common.SuccessResp(c, link)
 	return
